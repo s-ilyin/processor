@@ -2,57 +2,61 @@ package processor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
-	DefaultInterval    = 5 * time.Second
-	DefaultMaxRetry    = 1
-	DefaultConcurrency = 1
-	DefaultTimeout     = 30 * time.Second
-	DefaultName        = "DEFAULT"
-	DefaultNamespace   = "default"
-	DefaultRetryDelay  = time.Second
+	DefaultInterval       = 5 * time.Second
+	DefaultMetricInterval = 30 * time.Second
+	DefaultMaxAttempts    = 1
+	DefaultConcurrency    = 1
+	DefaultTimeout        = 30 * time.Second
+	DefaultName           = "DEFAULT"
+	DefaultRetryDelay     = time.Second
 )
 
 func DefaultConfig() Config {
 	return Config{
-		Name:        DefaultName,
-		Namespace:   DefaultNamespace,
-		Interval:    DefaultInterval,
-		MaxRetries:  DefaultMaxRetry,
-		Concurrency: DefaultConcurrency,
-		Timeout:     DefaultTimeout,
-		RetryDelay:  DefaultRetryDelay,
-		Registry:    prometheus.NewRegistry(),
+		Name:           DefaultName,
+		Interval:       DefaultInterval,
+		MetricInterval: DefaultMetricInterval,
+		MaxAttempts:    DefaultMaxAttempts,
+		Concurrency:    DefaultConcurrency,
+		Timeout:        DefaultTimeout,
+		RetryDelay:     DefaultRetryDelay,
 	}
 }
 
-func NewPeriodTask(c Config, h func(ctx context.Context) (bool, error)) *Processor {
+func NewPeriodTask(c Config, h func(ctx context.Context) (bool, error), opts ...Option) *Processor {
+	config := DefaultConfig()
 	if c.Interval <= 0 {
-		c.Interval = DefaultInterval
+		c.Interval = config.Interval
 	}
-	if c.MaxRetries <= 0 {
-		c.MaxRetries = DefaultMaxRetry
+	if c.MetricInterval <= 0 {
+		c.MetricInterval = config.MetricInterval
+	}
+	if c.MaxAttempts <= 0 {
+		c.MaxAttempts = config.MaxAttempts
 	}
 	if c.RetryDelay <= 0 {
-		c.RetryDelay = DefaultRetryDelay
+		c.RetryDelay = config.RetryDelay
 	}
 	if c.Concurrency <= 0 {
-		c.Concurrency = DefaultConcurrency
+		c.Concurrency = config.Concurrency
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = DefaultTimeout
+		c.Timeout = config.Timeout
 	}
 	if len(c.Name) == 0 {
-		c.Name = DefaultName
+		c.Name = config.Name
 	}
-	if len(c.Namespace) == 0 {
-		c.Namespace = DefaultNamespace
+	options := defaultOptions()
+
+	for _, opt := range opts {
+		opt(&options)
 	}
 
 	return &Processor{
@@ -61,71 +65,103 @@ func NewPeriodTask(c Config, h func(ctx context.Context) (bool, error)) *Process
 		stopCh:  make(chan struct{}),
 		sem:     make(chan struct{}, c.Concurrency),
 		release: make(chan bool, c.Concurrency),
-		m:       newMetrics(c.Namespace, c.Registry),
+		metrics: newMetrics(options.registry),
+		logger:  options.logger,
+		hooks: hooks{
+			onStart: options.onStart,
+			onStop:  options.onStop,
+			onError: options.onError,
+			onPanic: options.onPanic,
+		},
 	}
+}
+
+type hooks struct {
+	onStart func(ctx context.Context)
+	onStop  func(ctx context.Context)
+	onError func(ctx context.Context, err error)
+	onPanic func(ctx context.Context, val any)
 }
 
 type Processor struct {
 	mu      sync.Mutex
+	logger  *slog.Logger
 	wg      sync.WaitGroup
 	config  Config
+	hooks   hooks
 	stopCh  chan struct{}
 	sem     chan struct{} // семафор ограничения конкурентности
 	release chan bool     // канал сигналов завершения (true = были сообщения)
 	fn      func(ctx context.Context) (bool, error)
-	m       *metrics
+	metrics *metrics
 	started bool
+	stopped bool
 }
 
 type Config struct {
-	Name        string
-	Namespace   string
-	Interval    time.Duration
-	Timeout     time.Duration
-	RetryDelay  time.Duration
-	MaxRetries  int
-	Concurrency int
-	Registry    prometheus.Registerer
+	Name           string
+	MetricInterval time.Duration
+	Interval       time.Duration
+	Timeout        time.Duration
+	RetryDelay     time.Duration
+	MaxAttempts    int
+	Concurrency    int
 }
 
 // Start - запуск воркера
-func (p *Processor) Start(ctx context.Context) {
+func (p *Processor) Start(ctx context.Context) error {
 	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		return fmt.Errorf("processor %s: start after stop is not supported", p.config.Name)
+	}
+
 	if p.started {
 		p.mu.Unlock()
-		slog.Warn("processor already started", slog.String("name", p.config.Name))
-		return
+		p.logger.Warn("processor already started", slog.String("name", p.config.Name))
+
+		return nil
 	}
 	p.started = true
+	p.wg.Add(1)
 	p.mu.Unlock()
 
-	schedule := time.NewTimer(0)
+	var (
+		schedule        = time.NewTimer(0)
+		scheduleMetrics = time.NewTimer(p.config.MetricInterval)
+	)
 
-	slog.Info("processor started",
+	p.logger.Info("processor started",
 		slog.String("name", p.config.Name),
 		slog.Duration("interval", p.config.Interval),
 		slog.Int("concurrency", p.config.Concurrency),
-		slog.Int("max_retries", p.config.MaxRetries),
+		slog.Int("max_attempts", p.config.MaxAttempts),
 		slog.Duration("retry_delay", p.config.RetryDelay),
 	)
-	p.m.SetSemaphoreUsed(p.config.Name, 0)
+	p.metrics.SetSemaphoreUsed(p.config.Name, 0)
 
-	p.wg.Add(1)
 	go func() {
-		defer p.wg.Done()
-		defer schedule.Stop()
+		defer func() {
+			scheduleMetrics.Stop()
+			schedule.Stop()
+			p.wg.Done()
+		}()
+
+		p.onStart(ctx)
 		for {
 			select {
 			case <-ctx.Done():
-				slog.Info("processor stopping", slog.String("processor", p.config.Name))
+				p.logger.Info("processor stopping", slog.String("processor", p.config.Name))
 				return
 			case <-p.stopCh:
-				slog.Info("processor stopping", slog.String("processor", p.config.Name))
+				p.logger.Info("processor stopping", slog.String("processor", p.config.Name))
 				return
 			case <-schedule.C:
 				// плановый запуск
 				schedule.Reset(p.config.Interval)
 				p.tryStartTask(ctx)
+			case <-scheduleMetrics.C:
+				p.metrics.SetSemaphoreUsed(p.config.Name, len(p.sem))
 			case wait := <-p.release:
 				// горутина завершилась, завершенная гоуртина сообщает нужно ли ждать
 				if !wait {
@@ -139,6 +175,8 @@ func (p *Processor) Start(ctx context.Context) {
 			}
 		}
 	}()
+
+	return nil
 }
 
 // tryStart пытается запустить новую горутину, если есть место в семафоре
@@ -149,74 +187,68 @@ func (p *Processor) tryStartTask(ctx context.Context) bool {
 	case p.sem <- struct{}{}:
 		// Время ожидания семафора
 		waitDuration := time.Since(waitStart)
-		p.m.SetSemaphoreUsed(p.config.Name, len(p.sem))
 
 		p.wg.Add(1)
 		go func(startedAt time.Time, waitDuration time.Duration) {
-			var wait bool
-
-			defer func() {
-				<-p.sem
-				p.m.SetSemaphoreUsed(p.config.Name, len(p.sem))
-				p.wg.Done()
-			}()
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("processor task panic",
-						slog.String("processor", p.config.Name),
-						slog.Any("recover", r),
-					)
-				}
-
-				select {
-				case p.release <- wait:
-					return
-				default:
-					return
-				}
-			}()
-
-			ctxReq, cancel := context.WithTimeout(ctx, p.config.Timeout)
-			defer cancel()
-
 			var (
+				wait    bool
+				recov   bool
 				attempt int
 				err     error
 
 				executeStart = time.Now()
 			)
-			wait, attempt, err = p.executeWithRetry(ctxReq)
+			defer func() { p.wg.Done() }()
 
-			var (
-				executeDuration = time.Since(executeStart)
-				totalDuration   = time.Since(startedAt)
-
-				// Логируем с детализацией
-				logAttrs = []any{
-					slog.String("namespace", p.config.Namespace),
-					slog.String("processor", p.config.Name),
-					slog.Duration("wait_duration", waitDuration), // время ожидания семафора
-					slog.Duration("execute_duration", executeDuration),
-					slog.Duration("total_duration", totalDuration),
-					slog.Time("started_at", startedAt),
-					slog.Int("concurrency", p.config.Concurrency),
-					slog.Int("sem_used", len(p.sem)),
-					slog.Int("sem_available", cap(p.sem)-len(p.sem)),
-					slog.Int("attempt", attempt),
+			defer func() {
+				if r := recover(); r != nil {
+					recov = true
+					wait = true
+					p.logger.Error("processor task panic",
+						slog.String("processor", p.config.Name),
+						slog.Any("recover", r),
+					)
+					p.onPanic(ctx, r)
 				}
-			)
 
-			p.m.IncTasksTotal(p.config.Name, err == nil, attempt > 0)
-			p.m.ObserveTotalDuration(p.config.Name, totalDuration)
-			p.m.ObserveTaskDuration(p.config.Name, executeDuration)
-			p.m.ObserveWaitDuration(p.config.Name, waitDuration)
-			p.m.SetSemaphoreUsed(p.config.Name, len(p.sem))
+				p.metrics.IncTasksTotal(p.config.Name, err == nil && !recov, attempt > 0)
+				p.metrics.ObserveTotalDuration(p.config.Name, time.Since(startedAt))
+				p.metrics.ObserveTaskDuration(p.config.Name, time.Since(executeStart))
+				p.metrics.ObserveWaitDuration(p.config.Name, waitDuration)
+
+				<-p.sem
+
+				select {
+				case p.release <- wait:
+					return
+				case <-p.stopCh:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}()
+
+			wait, attempt, err = p.executeWithRetry(ctx)
+
+			// Логируем с детализацией
+			logAttrs := []any{
+				slog.String("processor", p.config.Name),
+				slog.Duration("wait_duration", waitDuration), // время ожидания семафора
+				slog.Duration("execute_duration", time.Since(executeStart)),
+				slog.Duration("total_duration", time.Since(startedAt)),
+				slog.Time("started_at", startedAt),
+				slog.Int("concurrency", p.config.Concurrency),
+				slog.Int("sem_used", len(p.sem)),
+				slog.Int("sem_available", cap(p.sem)-len(p.sem)),
+				slog.Int("attempt", attempt),
+			}
 
 			if err != nil {
+				p.onError(ctx, err)
 				logAttrs = append(logAttrs, slog.String("error", err.Error()))
-				slog.Error("processor task failed", logAttrs...)
+				p.logger.Error("processor task failed", logAttrs...)
 			}
-			slog.Debug("processor task completed", logAttrs...)
+			p.logger.Debug("processor task completed", logAttrs...)
 		}(time.Now(), waitDuration)
 	case <-ctx.Done():
 		// процессор заверщен
@@ -235,7 +267,7 @@ func (p *Processor) tryStartTask(ctx context.Context) bool {
 // executeWithRetry выполняет хендлер с повторными попытками при ошибке.
 // Возвращает результат wait и последнюю ошибку (или nil при успехе).
 func (p *Processor) executeWithRetry(ctx context.Context) (wait bool, attempt int, err error) {
-	for attempt = range p.config.MaxRetries {
+	for attempt = range p.config.MaxAttempts {
 		if attempt > 0 {
 			backoff := time.Duration(attempt) * p.config.RetryDelay
 			select {
@@ -244,8 +276,9 @@ func (p *Processor) executeWithRetry(ctx context.Context) (wait bool, attempt in
 			case <-time.After(backoff):
 			}
 		}
-
-		wait, err = p.fn(ctx)
+		ctxReq, cancel := context.WithTimeout(ctx, p.config.Timeout)
+		wait, err = p.fn(ctxReq)
+		cancel()
 		if err == nil {
 			return wait, attempt, nil
 		}
@@ -256,12 +289,21 @@ func (p *Processor) executeWithRetry(ctx context.Context) (wait bool, attempt in
 
 // Stop - остановка воркера
 func (p *Processor) Stop() {
-	slog.Info("stop processor", slog.String("processor", p.config.Name))
+	p.mu.Lock()
+	if !p.started || p.stopped {
+		p.mu.Unlock()
+		return
+	}
+	p.started = false
+	p.stopped = true
+	p.mu.Unlock()
+
+	p.logger.Info("stopped processor", slog.String("processor", p.config.Name))
 	close(p.stopCh)
 	p.wg.Wait()
+
 	close(p.sem)
 	close(p.release)
-	p.mu.Lock()
-	p.started = false
-	p.mu.Unlock()
+
+	p.onStop(context.Background())
 }
